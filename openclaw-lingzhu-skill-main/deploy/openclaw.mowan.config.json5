@@ -1,0 +1,36 @@
+{
+  gateway: {
+    port: 18789,
+    http: {
+      endpoints: {
+        chatCompletions: {
+          enabled: true,
+        },
+      },
+    },
+  },
+  plugins: {
+    entries: {
+      lingzhu: {
+        enabled: true,
+        config: {
+          authAk: "",
+          agentId: "main",
+          includeMetadata: true,
+          requestTimeoutMs: 60000,
+          sessionMode: "per_user",
+          sessionNamespace: "lingzhu",
+          defaultNavigationMode: "0",
+          enableFollowUp: true,
+          followUpMaxCount: 3,
+          maxImageBytes: 5242880,
+          systemPrompt: "你是部署在 Rokid 眼镜上的智能体助手。",
+          debugLogging: true,
+          debugLogPayloads: false,
+          debugLogDir: "",
+          enableExperimentalNativeActions: true,
+        },
+      },
+    },
+  },
+}
