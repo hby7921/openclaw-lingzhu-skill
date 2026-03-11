@@ -1,32 +1,38 @@
-﻿import type { IncomingMessage, ServerResponse } from "node:http";
-import type { LingzhuRequest, LingzhuConfig, LingzhuContext } from "./types.js";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { LingzhuConfig, LingzhuContext, LingzhuRequest, LingzhuSSEData } from "./types.js";
 import crypto from "node:crypto";
 import dns from "node:dns/promises";
+import http from "node:http";
+import https from "node:https";
 import { createWriteStream, promises as fs } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import {
-  lingzhuToOpenAI,
-  formatLingzhuSSE,
-  ToolCallAccumulator,
-  parseToolCallFromAccumulated,
-  detectIntentFromText,
   createFollowUpResponse,
+  detectIntentFromText,
   extractFollowUpFromText,
+  formatLingzhuSSE,
+  lingzhuToOpenAI,
+  parseToolCallFromAccumulated,
+  ToolCallAccumulator,
 } from "./transform.js";
 import { buildRequestLogName, summarizeForDebug, writeDebugLog } from "./debug-log.js";
+import { cleanupImageCacheIfNeeded, ensureImageCacheDir } from "./image-cache.js";
 import { createLingzhuToolSchemas } from "./lingzhu-tools.js";
-import {
-  cleanupImageCacheIfNeeded,
-  ensureImageCacheDir,
-} from "./image-cache.js";
 
 interface LingzhuRuntimeState {
   config: LingzhuConfig;
   authAk: string;
   gatewayPort: number;
   chatCompletionsEnabled?: boolean;
+}
+
+interface ValidatedRemoteImageUrl {
+  url: URL;
+  address: string;
+  family: number;
 }
 
 const REMOTE_IMAGE_PROTOCOLS = new Set(["http:", "https:"]);
@@ -76,31 +82,28 @@ function buildSessionKey(config: LingzhuConfig, body: LingzhuRequest): string {
   }
 }
 
-/**
- * 验证 Authorization 头
- */
 function verifyAuth(
   authHeader: string | string[] | undefined,
   expectedAk: string
 ): boolean {
   if (!expectedAk) {
-    // 未配置 AK 时跳过验证
     return true;
   }
 
   const header = Array.isArray(authHeader) ? authHeader[0] : authHeader;
-  if (!header) return false;
+  if (!header) {
+    return false;
+  }
 
   const match = header.match(/^Bearer\s+(.+)$/i);
-  if (!match) return false;
+  if (!match) {
+    return false;
+  }
 
   return match[1].trim() === expectedAk;
 }
 
-/**
- * 读取 JSON 请求体
- */
-async function readJsonBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<any> {
+async function readJsonBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<unknown> {
   const chunks: Buffer[] = [];
   let totalBytes = 0;
 
@@ -119,100 +122,105 @@ async function readJsonBody(req: IncomingMessage, maxBytes = 1024 * 1024): Promi
       try {
         const body = Buffer.concat(chunks).toString("utf-8");
         resolve(body ? JSON.parse(body) : {});
-      } catch (e) {
-        reject(e);
+      } catch (error) {
+        reject(error);
       }
     });
 
-    req.on("error", (e) => reject(e));
+    req.on("error", reject);
   });
 }
 
-/**
- * 下载图片到本地临时目录，返回 file:// URL
- */
+function readHeaderValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) {
+    return value[0] ?? "";
+  }
+
+  return value ?? "";
+}
+
 async function downloadImageToFile(imageUrl: string, maxBytes: number): Promise<string | null> {
   try {
-    const parsedUrl = await validateRemoteImageUrl(imageUrl);
-    if (!parsedUrl) {
+    const validatedUrl = await validateRemoteImageUrl(imageUrl);
+    if (!validatedUrl) {
       return null;
     }
 
-    const controller = new AbortController();
-    const timeoutHandle = setTimeout(() => controller.abort(), REMOTE_IMAGE_TIMEOUT_MS);
-    const response = await fetch(parsedUrl, { redirect: "error", signal: controller.signal })
-      .finally(() => clearTimeout(timeoutHandle));
-    if (!response.ok) {
+    const response = await requestValidatedRemoteImage(validatedUrl);
+    if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+      response.resume();
       return null;
     }
 
-    const contentLength = Number(response.headers.get("content-length") || "0");
+    const contentLength = Number(readHeaderValue(response.headers["content-length"]) || "0");
     if (contentLength > maxBytes) {
+      response.resume();
       return null;
     }
 
-    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const contentType = readHeaderValue(response.headers["content-type"]).toLowerCase();
     if (contentType && !contentType.startsWith("image/")) {
+      response.resume();
       return null;
     }
 
-    const ext = contentType.includes("png") ? ".png"
-      : contentType.includes("jpeg") || contentType.includes("jpg") ? ".jpg"
-        : contentType.includes("gif") ? ".gif"
-          : contentType.includes("webp") ? ".webp"
+    const ext = contentType.includes("png")
+      ? ".png"
+      : contentType.includes("jpeg") || contentType.includes("jpg")
+        ? ".jpg"
+        : contentType.includes("gif")
+          ? ".gif"
+          : contentType.includes("webp")
+            ? ".webp"
             : ".img";
 
     const cacheDir = await ensureImageCacheDir();
-
     const hash = crypto.createHash("md5").update(imageUrl).digest("hex").slice(0, 12);
     const fileName = `img_${Date.now()}_${hash}${ext}`;
     const filePath = path.join(cacheDir, fileName);
-    const reader = response.body?.getReader();
-    if (!reader) {
-      return null;
-    }
-
     const fileStream = createWriteStream(filePath, { flags: "wx" });
     let totalBytes = 0;
     let completed = false;
 
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (!value) {
-          continue;
-        }
-
-        totalBytes += value.byteLength;
-        if (totalBytes > maxBytes) {
-          await reader.cancel("image exceeds size limit");
-          fileStream.destroy();
-          await fs.unlink(filePath).catch(() => undefined);
-          return null;
-        }
-
-        await new Promise<void>((resolve, reject) => {
-          fileStream.write(Buffer.from(value), (error: Error | null | undefined) => {
-            if (error) {
-              reject(error);
-            } else {
-              resolve();
-            }
-          });
-        });
-      }
-
       await new Promise<void>((resolve, reject) => {
-        fileStream.end((error: Error | null | undefined) => {
-          if (error) {
-            reject(error);
-          } else {
-            resolve();
+        let settled = false;
+
+        const fail = (error: Error) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          response.destroy();
+          fileStream.destroy();
+          reject(error);
+        };
+
+        response.on("data", (chunk: Buffer) => {
+          totalBytes += chunk.length;
+          if (totalBytes > maxBytes) {
+            fail(new Error("image exceeds size limit"));
+            return;
+          }
+
+          if (!fileStream.write(chunk)) {
+            response.pause();
+            fileStream.once("drain", () => response.resume());
           }
         });
+
+        response.on("end", () => {
+          if (settled) {
+            return;
+          }
+          fileStream.end(() => {
+            settled = true;
+            resolve();
+          });
+        });
+
+        response.on("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
+        fileStream.on("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
       });
       completed = true;
     } finally {
@@ -239,6 +247,7 @@ async function saveDataUrlToFile(dataUrl: string, maxBytes: number): Promise<str
   if (estimateBase64DecodedBytes(payload) > maxBytes) {
     return null;
   }
+
   const buffer = Buffer.from(payload, "base64");
   if (buffer.length > maxBytes) {
     return null;
@@ -305,7 +314,7 @@ function isPrivateAddress(address: string): boolean {
   return false;
 }
 
-async function validateRemoteImageUrl(imageUrl: string): Promise<URL | null> {
+async function validateRemoteImageUrl(imageUrl: string): Promise<ValidatedRemoteImageUrl | null> {
   let parsedUrl: URL;
 
   try {
@@ -329,14 +338,66 @@ async function validateRemoteImageUrl(imageUrl: string): Promise<URL | null> {
 
   try {
     const resolved = await dns.lookup(parsedUrl.hostname, { all: true, verbatim: true });
-    if (resolved.length === 0 || resolved.some((entry) => isPrivateAddress(entry.address))) {
+    const safeEntry = resolved.find((entry) => !isPrivateAddress(entry.address));
+    if (!safeEntry || resolved.some((entry) => isPrivateAddress(entry.address))) {
       return null;
     }
+
+    return {
+      url: parsedUrl,
+      address: safeEntry.address,
+      family: safeEntry.family,
+    };
   } catch {
     return null;
   }
+}
 
-  return parsedUrl;
+async function requestValidatedRemoteImage(target: ValidatedRemoteImageUrl): Promise<IncomingMessage> {
+  const client = target.url.protocol === "https:" ? https : http;
+  const defaultPort = target.url.protocol === "https:" ? 443 : 80;
+  const port = target.url.port ? Number(target.url.port) : defaultPort;
+  const hostHeader = target.url.port ? `${target.url.hostname}:${target.url.port}` : target.url.hostname;
+
+  return new Promise<IncomingMessage>((resolve, reject) => {
+    const request = client.request(
+      {
+        protocol: target.url.protocol,
+        host: target.address,
+        port,
+        method: "GET",
+        path: `${target.url.pathname}${target.url.search}`,
+        headers: {
+          Host: hostHeader,
+          "User-Agent": "openclaw-lingzhu/1.0",
+        },
+        family: target.family,
+        servername: target.url.protocol === "https:" ? target.url.hostname : undefined,
+        lookup: (_hostname, _options, callback) => {
+          callback(null, target.address, target.family);
+        },
+        checkServerIdentity:
+          target.url.protocol === "https:"
+            ? (_hostname, cert) => tls.checkServerIdentity(target.url.hostname, cert)
+            : undefined,
+      },
+      (response) => {
+        const statusCode = response.statusCode ?? 0;
+        if (statusCode >= 300 && statusCode < 400) {
+          response.resume();
+          reject(new Error("redirect not allowed"));
+          return;
+        }
+        resolve(response);
+      }
+    );
+
+    request.setTimeout(REMOTE_IMAGE_TIMEOUT_MS, () => {
+      request.destroy(new Error("remote image timeout"));
+    });
+    request.on("error", reject);
+    request.end();
+  });
 }
 
 function isPathWithinDirectory(filePath: string, parentDir: string): boolean {
@@ -354,11 +415,6 @@ async function resolveTrustedFileUrl(fileUrl: string): Promise<string | null> {
   }
 }
 
-/**
- * 预处理 OpenAI 消息：下载图片到本地并将路径嵌入到文本消息中
- * 注意：OpenClaw 的 /v1/chat/completions API 只提取文本内容，忽略 image_url
- * 因此我们将图片路径直接嵌入到文本中
- */
 async function preprocessOpenAIMessages(
   messages: Array<{
     role: "system" | "user" | "assistant";
@@ -380,7 +436,6 @@ async function preprocessOpenAIMessages(
       continue;
     }
 
-    // 处理多模态消息：收集文本和图片路径
     const textParts: string[] = [];
     const imagePaths: string[] = [];
 
@@ -388,17 +443,17 @@ async function preprocessOpenAIMessages(
       if (part.type === "text" && part.text) {
         textParts.push(part.text);
       } else if (part.type === "image_url" && part.image_url?.url) {
-        const url = part.image_url.url;
+        const imagePartUrl = part.image_url.url;
 
-        if (url.startsWith("file://")) {
-          const localPath = await resolveTrustedFileUrl(url);
+        if (imagePartUrl.startsWith("file://")) {
+          const localPath = await resolveTrustedFileUrl(imagePartUrl);
           if (localPath) {
             imagePaths.push(localPath);
           } else {
             logger.warn("[Lingzhu] 已拒绝非缓存目录 file URL");
           }
-        } else if (url.startsWith("data:")) {
-          const fileUrl = await saveDataUrlToFile(url, maxImageBytes);
+        } else if (imagePartUrl.startsWith("data:")) {
+          const fileUrl = await saveDataUrlToFile(imagePartUrl, maxImageBytes);
           if (fileUrl) {
             imagePaths.push(fileUrl.replace("file://", ""));
             logger.info("[Lingzhu] data URL 图片已保存到本地缓存");
@@ -406,29 +461,25 @@ async function preprocessOpenAIMessages(
             logger.warn("[Lingzhu] data URL 图片处理失败或超出大小限制");
           }
         } else {
-          // 下载图片到本地文件
-          logger.info(`[Lingzhu] 正在下载图片到本地: ${url.substring(0, 80)}...`);
-          const fileUrl = await downloadImageToFile(url, maxImageBytes);
+          logger.info(`[Lingzhu] 正在下载图片到本地: ${imagePartUrl.substring(0, 80)}...`);
+          const fileUrl = await downloadImageToFile(imagePartUrl, maxImageBytes);
           if (fileUrl) {
             imagePaths.push(fileUrl.replace("file://", ""));
             logger.info(`[Lingzhu] 图片已保存到: ${fileUrl}`);
           } else {
-            logger.warn(`[Lingzhu] 图片下载失败或地址被拒绝: ${url}`);
+            logger.warn(`[Lingzhu] 图片下载失败或地址被拒绝: ${imagePartUrl}`);
           }
         }
       }
     }
 
-    // 构建最终的文本消息
     let finalContent = textParts.join("\n");
 
-    // 如果有图片，将图片路径嵌入到消息中
     if (imagePaths.length > 0) {
-      const imageRefs = imagePaths.map((p) => `[图片: ${p}]`).join("\n");
+      const imageRefs = imagePaths.map((imagePath) => `[图片: ${imagePath}]`).join("\n");
       if (finalContent) {
         finalContent = `${finalContent}\n\n${imageRefs}`;
       } else {
-        // 如果只有图片没有文字，添加占位文本
         finalContent = `用户发送了一张图片\n\n${imageRefs}`;
         logger.info("[Lingzhu] 为纯图片消息添加了占位文本");
       }
@@ -442,9 +493,6 @@ async function preprocessOpenAIMessages(
   return result;
 }
 
-/**
- * 创建 HTTP 处理器
- */
 export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntimeState) {
   return async function handler(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -459,20 +507,21 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
           endpoint: "/metis/agent/api/sse",
           enabled: state.config.enabled !== false,
           agentId: state.config.agentId || "main",
-          supportedCommands: state.config.enableExperimentalNativeActions === true
-            ? [
-              "take_photo",
-              "take_navigation",
-              "control_calendar",
-              "notify_agent_off",
-              "send_notification",
-              "send_toast",
-              "speak_tts",
-              "start_video_record",
-              "stop_video_record",
-              "open_custom_view",
-            ]
-            : ["take_photo", "take_navigation", "control_calendar", "notify_agent_off"],
+          supportedCommands:
+            state.config.enableExperimentalNativeActions === true
+              ? [
+                "take_photo",
+                "take_navigation",
+                "control_calendar",
+                "notify_agent_off",
+                "send_notification",
+                "send_toast",
+                "speak_tts",
+                "start_video_record",
+                "stop_video_record",
+                "open_custom_view",
+              ]
+              : ["take_photo", "take_navigation", "control_calendar", "notify_agent_off"],
           followUpEnabled: state.config.enableFollowUp !== false,
           sessionMode: state.config.sessionMode || "per_user",
           debugLogging: state.config.debugLogging === true,
@@ -484,7 +533,7 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
     }
 
     if (url.pathname !== "/metis/agent/api/sse") {
-      return false; // 不处理该路径，由后续处理器处理
+      return false;
     }
 
     if (req.method !== "POST") {
@@ -496,6 +545,42 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
     const logger = api.logger;
     const state = getRuntimeState();
     const config = state.config;
+    const upstreamController = new AbortController();
+    let keepaliveInterval: NodeJS.Timeout | undefined;
+
+    const stopKeepalive = () => {
+      if (keepaliveInterval) {
+        clearInterval(keepaliveInterval);
+        keepaliveInterval = undefined;
+      }
+    };
+
+    const safeWrite = (payload: string): boolean => {
+      if (res.writableEnded || res.destroyed) {
+        return false;
+      }
+
+      try {
+        res.write(payload);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const abortUpstream = (reason: string) => {
+      stopKeepalive();
+      if (!upstreamController.signal.aborted) {
+        upstreamController.abort(reason);
+      }
+    };
+
+    req.on("aborted", () => abortUpstream("Client disconnected"));
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        abortUpstream("Client disconnected");
+      }
+    });
 
     if (config.enabled === false) {
       res.statusCode = 503;
@@ -504,7 +589,6 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
       return true;
     }
 
-    // 验证鉴权（使用生效中的 AK，支持自动生成场景）
     const authHeader = req.headers.authorization;
     if (!verifyAuth(authHeader, state.authAk || "")) {
       logger.warn("[Lingzhu] Unauthorized request");
@@ -518,16 +602,11 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
     let requestAgentId = "unknown";
 
     try {
-      // 解析请求体
       const body = (await readJsonBody(req)) as LingzhuRequest | undefined;
       if (!body || !body.message_id || !body.agent_id || !Array.isArray(body.message)) {
         res.statusCode = 400;
         res.setHeader("Content-Type", "application/json");
-        res.end(
-          JSON.stringify({
-            error: "Missing required fields: message_id, agent_id, message",
-          })
-        );
+        res.end(JSON.stringify({ error: "Missing required fields: message_id, agent_id, message" }));
         return true;
       }
 
@@ -548,28 +627,34 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
         `[Lingzhu] Request: message_id=${body.message_id}, agent_id=${body.agent_id}, messages=${body.message.length}`
       );
 
-      // 设置 SSE 响应头
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
       res.setHeader("X-Accel-Buffering", "no");
+      if (typeof res.flushHeaders === "function") {
+        res.flushHeaders();
+      }
 
-      // 转换消息格式（根据配置决定是否包含设备信息）
-      const includeMetadata = config.includeMetadata !== false; // 默认 true
-      const maxImageBytes = resolveMaxImageBytes(config);
-      await cleanupImageCacheIfNeeded();
-      const context = includeMetadata ? normalizeContext(body.metadata) : undefined;
-      let openaiMessages = lingzhuToOpenAI(
-        body.message,
-        context,
-        {
-          systemPrompt: config.systemPrompt,
-          defaultNavigationMode: config.defaultNavigationMode,
-          enableExperimentalNativeActions: config.enableExperimentalNativeActions,
+      safeWrite(": keepalive\n\n");
+      keepaliveInterval = setInterval(() => {
+        if (!safeWrite(": keepalive\n\n")) {
+          stopKeepalive();
         }
-      );
+      }, 7000);
 
-      // 预处理消息：下载图片并为纯图片消息添加占位文本
+      const includeMetadata = config.includeMetadata !== false;
+      const maxImageBytes = resolveMaxImageBytes(config);
+      void cleanupImageCacheIfNeeded().catch((error) => {
+        logger.warn(`[Lingzhu] 图片缓存清理失败: ${error instanceof Error ? error.message : String(error)}`);
+      });
+
+      const context = includeMetadata ? normalizeContext(body.metadata) : undefined;
+      let openaiMessages = lingzhuToOpenAI(body.message, context, {
+        systemPrompt: config.systemPrompt,
+        defaultNavigationMode: config.defaultNavigationMode,
+        enableExperimentalNativeActions: config.enableExperimentalNativeActions,
+      });
+
       openaiMessages = await preprocessOpenAIMessages(openaiMessages as any, logger, maxImageBytes);
       const hasUserMsg = openaiMessages.some((message) => message.role === "user");
       if (!hasUserMsg) {
@@ -577,21 +662,16 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
         openaiMessages.push({ role: "user", content: fallbackText });
         logger.warn(`[Lingzhu] No user message after transform, fallback=${fallbackText}`);
       }
+
       logger.info(
         `[Lingzhu] includeMetadata=${includeMetadata}, openaiMessages=${openaiMessages.length}, maxImageBytes=${maxImageBytes}`
       );
 
-      // 生成 session key
       const sessionKey = buildSessionKey(config, body);
       const targetAgentId = config.agentId || body.agent_id || "main";
-
-      // 获取 gateway 端口和 token
       const gatewayPort = api.config?.gateway?.port ?? state.gatewayPort ?? 18789;
       const gatewayToken = api.config?.gateway?.auth?.token;
-
       const lingzhuTools = createLingzhuToolSchemas(config.enableExperimentalNativeActions === true);
-
-      // 调用 OpenClaw /v1/chat/completions API
       const openclawUrl = `http://127.0.0.1:${gatewayPort}/v1/chat/completions`;
       const openclawBody = {
         model: `openclaw:${targetAgentId}`,
@@ -607,7 +687,7 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
         "x-openclaw-session-key": sessionKey,
       };
       if (gatewayToken) {
-        headers["Authorization"] = `Bearer ${gatewayToken}`;
+        headers.Authorization = `Bearer ${gatewayToken}`;
       }
 
       writeDebugLog(
@@ -620,16 +700,18 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
         }
       );
 
-      const timeoutMs = typeof config.requestTimeoutMs === "number"
-        ? Math.max(5000, Math.min(300000, Math.trunc(config.requestTimeoutMs)))
-        : 60000;
+      const timeoutMs =
+        typeof config.requestTimeoutMs === "number"
+          ? Math.max(5000, Math.min(300000, Math.trunc(config.requestTimeoutMs)))
+          : 60000;
 
       logger.info(
         `[Lingzhu] Calling OpenClaw: ${openclawUrl}, agentId=${targetAgentId}, sessionKey=${sessionKey}, timeout=${timeoutMs}ms`
       );
 
-      const timeoutController = new AbortController();
-      const timeoutHandle = setTimeout(() => timeoutController.abort(), timeoutMs);
+      const timeoutHandle = setTimeout(() => {
+        abortUpstream(`OpenClaw request timeout after ${timeoutMs}ms`);
+      }, timeoutMs);
 
       let openclawResponse: Response;
       try {
@@ -637,11 +719,11 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
           method: "POST",
           headers,
           body: JSON.stringify(openclawBody),
-          signal: timeoutController.signal,
+          signal: upstreamController.signal,
         });
       } catch (error) {
-        if (error instanceof Error && error.name === "AbortError") {
-          throw new Error(`OpenClaw request timeout after ${timeoutMs}ms`);
+        if (upstreamController.signal.aborted) {
+          throw new Error(String(upstreamController.signal.reason || `OpenClaw request timeout after ${timeoutMs}ms`));
         }
         throw error;
       } finally {
@@ -653,13 +735,9 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
         throw new Error(`OpenClaw API error: ${openclawResponse.status} - ${errorText}`);
       }
 
-      // 收集完整响应用于提取 follow_up
       let fullResponse = "";
-
-      // 工具调用累积器 - 处理流式 tool_calls 参数分片
       const toolAccumulator = new ToolCallAccumulator();
-
-      // 流式解析 OpenAI SSE
+      const streamedToolCalls: LingzhuSSEData[] = [];
       const reader = openclawResponse.body?.getReader();
       if (!reader) {
         throw new Error("No response body");
@@ -668,20 +746,12 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
       const decoder = new TextDecoder();
       let buffer = "";
 
-      // 保活机制：每 7 秒发送 SSE 注释，防止灵珠超时断开
-      const keepaliveInterval = setInterval(() => {
-        try {
-          res.write(": keepalive\n\n");
-        } catch {
-          // 连接已关闭，忽略
-          clearInterval(keepaliveInterval);
-        }
-      }, 7000);
-
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            break;
+          }
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split("\n");
@@ -689,7 +759,9 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
 
           for (const line of lines) {
             const trimmed = line.trim();
-            if (!trimmed.startsWith("data: ")) continue;
+            if (!trimmed.startsWith("data: ")) {
+              continue;
+            }
 
             const data = trimmed.slice(6);
             if (data === "[DONE]") {
@@ -701,7 +773,6 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
               const delta = chunk.choices?.[0]?.delta;
               const finishReason = chunk.choices?.[0]?.finish_reason;
 
-              // 累积工具调用片段（不立即发送，等完整后再发送）
               if (delta?.tool_calls) {
                 toolAccumulator.accumulate(delta.tool_calls);
               }
@@ -712,26 +783,21 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
                 summarizeForDebug(chunk, includePayload)
               );
 
-              // 兼容模式：仅累积文本，结束后一次性返回给灵珠。
-              // 灵珠端对分片 answer + done 的容错较差，先收敛到最保守协议。
               if (delta?.content) {
                 fullResponse += delta.content;
               }
 
-              // 当流结束且有工具调用时，发送完整的工具调用
               if (finishReason === "tool_calls" || (finishReason && toolAccumulator.hasTools())) {
-                const completedTools = toolAccumulator.getCompleted();
-
-                for (const tool of completedTools) {
+                for (const tool of toolAccumulator.getCompleted()) {
                   const lingzhuToolCall = parseToolCallFromAccumulated(tool.name, tool.arguments, {
                     defaultNavigationMode: config.defaultNavigationMode,
                     enableExperimentalNativeActions: config.enableExperimentalNativeActions,
                   });
 
                   if (lingzhuToolCall) {
-                    const toolData = {
-                      role: "agent" as const,
-                      type: "tool_call" as const,
+                    const toolData: LingzhuSSEData = {
+                      role: "agent",
+                      type: "tool_call",
                       message_id: body.message_id,
                       agent_id: body.agent_id,
                       is_finish: true,
@@ -742,23 +808,44 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
                       buildRequestLogName(body.message_id, "response.tool_call"),
                       summarizeForDebug(toolData, includePayload)
                     );
-                    res.write(formatLingzhuSSE("message", toolData));
+                    streamedToolCalls.push(toolData);
                   }
                 }
               }
             } catch {
-              // 忽略解析错误
+              // Ignore chunk parse failures.
             }
           }
         }
       } finally {
-        clearInterval(keepaliveInterval);
+        stopKeepalive();
       }
 
-      const hasToolCall = toolAccumulator.hasTools();
+      const hasToolCall = streamedToolCalls.length > 0;
 
-      // 仅当模型返回了显式工具标记时，才从完整文本中回退解析 tool_call。
-      // 普通自然语言回答后再补发 tool_call，灵珠端容易判定为异常结束包。
+      if (hasToolCall && fullResponse.trim()) {
+        const answerBeforeToolData: LingzhuSSEData = {
+          role: "agent",
+          type: "answer",
+          answer_stream: fullResponse,
+          message_id: body.message_id,
+          agent_id: body.agent_id,
+          is_finish: false,
+        };
+        writeDebugLog(
+          config,
+          buildRequestLogName(body.message_id, "response.answer_before_tool"),
+          summarizeForDebug(answerBeforeToolData, includePayload)
+        );
+        safeWrite(formatLingzhuSSE("message", answerBeforeToolData));
+      }
+
+      if (hasToolCall) {
+        for (const toolData of streamedToolCalls) {
+          safeWrite(formatLingzhuSSE("message", toolData));
+        }
+      }
+
       if (!hasToolCall && fullResponse && fullResponse.includes("<LINGZHU_TOOL_CALL:")) {
         const detectedIntent = detectIntentFromText(fullResponse, {
           defaultNavigationMode: config.defaultNavigationMode,
@@ -766,9 +853,9 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
         });
         if (detectedIntent) {
           logger.info(`[Lingzhu] 从文本检测到意图: ${JSON.stringify(detectedIntent)}`);
-          const toolData = {
-            role: "agent" as const,
-            type: "tool_call" as const,
+          const toolData: LingzhuSSEData = {
+            role: "agent",
+            type: "tool_call",
             message_id: body.message_id,
             agent_id: body.agent_id,
             is_finish: true,
@@ -781,12 +868,12 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
             buildRequestLogName(body.message_id, "response.intent_fallback"),
             summarizeForDebug(toolData, includePayload)
           );
-          res.write(sseOutput);
+          safeWrite(sseOutput);
         }
       } else if (!hasToolCall && fullResponse) {
-        const finalAnswerData = {
-          role: "agent" as const,
-          type: "answer" as const,
+        const finalAnswerData: LingzhuSSEData = {
+          role: "agent",
+          type: "answer",
           answer_stream: fullResponse,
           message_id: body.message_id,
           agent_id: body.agent_id,
@@ -797,7 +884,7 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
           buildRequestLogName(body.message_id, "response.final_answer"),
           summarizeForDebug(finalAnswerData, includePayload)
         );
-        res.write(formatLingzhuSSE("message", finalAnswerData));
+        safeWrite(formatLingzhuSSE("message", finalAnswerData));
 
         if (config.enableFollowUp !== false) {
           const followUps = extractFollowUpFromText(
@@ -812,7 +899,7 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
               buildRequestLogName(body.message_id, "response.follow_up"),
               summarizeForDebug(followUpData, includePayload)
             );
-            res.write(formatLingzhuSSE("message", followUpData));
+            safeWrite(formatLingzhuSSE("message", followUpData));
           }
         }
       }
@@ -825,9 +912,13 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
           fullResponse: summarizeForDebug(fullResponse, includePayload),
         }
       );
-      res.end();
+
+      if (!res.writableEnded) {
+        res.end();
+      }
       logger.info(`[Lingzhu] Completed: message_id=${body.message_id}`);
     } catch (error) {
+      stopKeepalive();
       const errorMsg = error instanceof Error ? error.message : String(error);
       logger.error(`[Lingzhu] Error: ${errorMsg}`);
       writeDebugLog(
@@ -841,17 +932,18 @@ export function createHttpHandler(api: any, getRuntimeState: () => LingzhuRuntim
         true
       );
 
-      // 发送错误响应
-      const errorData = {
-        role: "agent" as const,
-        type: "answer" as const,
-        answer_stream: `[错误] ${errorMsg}`,
-        message_id: requestMessageId,
-        agent_id: requestAgentId,
-        is_finish: true,
-      };
-      res.write(formatLingzhuSSE("message", errorData));
-      res.end();
+      if (!upstreamController.signal.aborted && !res.writableEnded) {
+        const errorData: LingzhuSSEData = {
+          role: "agent",
+          type: "answer",
+          answer_stream: `[错误] ${errorMsg}`,
+          message_id: requestMessageId,
+          agent_id: requestAgentId,
+          is_finish: true,
+        };
+        safeWrite(formatLingzhuSSE("message", errorData));
+        res.end();
+      }
     }
 
     return true;
