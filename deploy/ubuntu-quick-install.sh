@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/hby7921/openclaw-mowan.git}"
-APP_DIR="${APP_DIR:-/opt/openclaw-mowan}"
+REPO_URL="${REPO_URL:-https://github.com/hby7921/openclaw-lingzhu.git}"
+APP_DIR="${APP_DIR:-/opt/openclaw-lingzhu}"
 PLUGIN_DIR="${PLUGIN_DIR:-$APP_DIR/skill/extension}"
 OPENCLAW_CMD="${OPENCLAW_CMD:-openclaw}"
 BRANCH="${BRANCH:-main}"
@@ -30,7 +30,7 @@ echo "[4/6] linking plugin into OpenClaw"
 "$OPENCLAW_CMD" plugins install --link "$PLUGIN_DIR"
 
 echo "[5/6] deployment files"
-echo "config template: $APP_DIR/deploy/openclaw.mowan.config.json5"
+echo "config template: $APP_DIR/deploy/openclaw.lingzhu.config.json5"
 echo "systemd template: $APP_DIR/deploy/openclaw-gateway.service.example"
 
 echo "[6/6] next steps"
@@ -47,5 +47,5 @@ cat <<EOF
 
 Lingzhu platform values:
 - SSE URL: http://<your-public-ip>:18789/metis/agent/api/sse
-- AK: output from '$OPENCLAW_CMD lingzhu info'
+- AK: run '$OPENCLAW_CMD lingzhu curl' and copy the Bearer token
 EOF

@@ -1,0 +1,5 @@
+skill/extension/node_modules/
+skill/extension/logs/
+skill/extension/.cache/
+skill/.lingzhu.ak
+npm-debug.log*

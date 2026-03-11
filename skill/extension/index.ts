@@ -1,4 +1,4 @@
-import fs from "node:fs";
+﻿import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { lingzhuConfigSchema, resolveLingzhuConfig, generateAuthAk } from "./src/config.js";
@@ -14,6 +14,18 @@ const AK_FILE = path.join(__dirname, "../.lingzhu.ak"); // 存储在插件根目
 let pluginConfig: LingzhuConfig = {};
 let activeAuthAk = "";
 let gatewayPort = 18789;
+
+function maskSecret(secret: string): string {
+  if (!secret) {
+    return "(empty)";
+  }
+
+  if (secret.length <= 8) {
+    return "*".repeat(secret.length);
+  }
+
+  return `${secret.slice(0, 4)}${"*".repeat(secret.length - 8)}${secret.slice(-4)}`;
+}
 
 /**
  * 灵珠平台接入插件
@@ -39,7 +51,7 @@ const lingzhuPlugin = {
       if (fs.existsSync(AK_FILE)) {
         try {
           activeAuthAk = fs.readFileSync(AK_FILE, "utf-8").trim();
-          logger.info(`[Lingzhu] 已从本地记录加载 AK: ${activeAuthAk}`);
+          logger.info("[Lingzhu] 已从本地记录加载 AK");
         } catch (e) {
           logger.warn(`[Lingzhu] 读取本地 AK 文件失败: ${e}`);
         }
@@ -50,7 +62,7 @@ const lingzhuPlugin = {
         activeAuthAk = generateAuthAk();
         try {
           fs.writeFileSync(AK_FILE, activeAuthAk, "utf-8");
-          logger.info(`[Lingzhu] 自动生成并持久化 AK: ${activeAuthAk}`);
+          logger.info("[Lingzhu] 已自动生成并持久化 AK");
         } catch (e) {
           logger.warn(`[Lingzhu] 持久化 AK 文件失败: ${e}`);
         }
@@ -60,24 +72,42 @@ const lingzhuPlugin = {
     // 获取 Gateway 端口
     gatewayPort = api.config?.gateway?.port ?? 18789;
 
-    // 配置获取函数
+    // 配置/状态获取函数
     const getConfig = () => pluginConfig;
-    const getState = () => ({
+    const getRuntimeState = () => ({
       config: pluginConfig,
       authAk: activeAuthAk,
       gatewayPort,
+      chatCompletionsEnabled: api.config?.gateway?.http?.endpoints?.chatCompletions?.enabled === true,
     });
 
     // 1. 注册 HTTP 路由
-    if (typeof api.registerHttpHandler === "function") {
-      api.registerHttpHandler(createHttpHandler(api, getConfig));
+    if (typeof api.registerHttpRoute === "function") {
+      const httpHandler = createHttpHandler(api, getRuntimeState);
+      api.registerHttpRoute({
+        path: "/metis/agent/api/sse",
+        handler: httpHandler,
+        auth: "plugin" as const,
+        match: "exact" as const,
+      });
+      api.registerHttpRoute({
+        path: "/metis/agent/api/health",
+        handler: httpHandler,
+        auth: "plugin" as const,
+        match: "exact" as const,
+      });
+      logger.info("[Lingzhu] 已注册 HTTP 路由: /metis/agent/api/sse, /metis/agent/api/health");
+    } else if (typeof api.registerHttpHandler === "function") {
+      api.registerHttpHandler(createHttpHandler(api, getRuntimeState));
       logger.info("[Lingzhu] 已注册 HTTP 端点: POST /metis/agent/api/sse");
     }
 
     // 2. 注册灵珠设备工具
     logger.info(`[Lingzhu] 检查 registerTool API: ${typeof api.registerTool}`);
-    if (typeof api.registerTool === "function") {
-      const tools = createLingzhuTools();
+    if (pluginConfig.enabled === false) {
+      logger.info("[Lingzhu] 插件已禁用，跳过设备工具注册");
+    } else if (typeof api.registerTool === "function") {
+      const tools = createLingzhuTools(pluginConfig.enableExperimentalNativeActions === true);
       logger.info(`[Lingzhu] 准备注册 ${tools.length} 个工具`);
       for (const tool of tools) {
         try {
@@ -94,7 +124,7 @@ const lingzhuPlugin = {
     // 3. 注册 CLI 命令
     if (typeof api.registerCli === "function") {
       api.registerCli(
-        (ctx: any) => registerLingzhuCli(ctx, getState),
+        (ctx: any) => registerLingzhuCli(ctx, getRuntimeState),
         { commands: ["lingzhu"] }
       );
     }
@@ -116,7 +146,7 @@ const lingzhuPlugin = {
           console.log("║                    Lingzhu Bridge 已启动                              ║");
           console.log("╠═══════════════════════════════════════════════════════════════════════╣");
           console.log(`║  SSE 接口:  ${url.padEnd(56)}║`);
-          console.log(`║  鉴权 AK:   ${activeAuthAk.padEnd(56)}║`);
+          console.log(`║  鉴权 AK:   ${maskSecret(activeAuthAk).padEnd(56)}║`);
           console.log("╚═══════════════════════════════════════════════════════════════════════╝");
           console.log("");
 

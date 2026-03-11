@@ -24,7 +24,7 @@
           enableFollowUp: true,
           followUpMaxCount: 3,
           maxImageBytes: 5242880,
-          systemPrompt: "你是部署在 Rokid 眼镜上的智能体助手。",
+          systemPrompt: "你是部署在 Rokid 眼镜上的智能助手。",
           debugLogging: true,
           debugLogPayloads: false,
           debugLogDir: "",

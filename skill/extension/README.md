@@ -1,22 +1,20 @@
-# Lingzhu Bridge Plugin
+# OpenClaw Lingzhu
 
-灵珠平台接入 OpenClaw 的协议转换插件。
+面向 Rokid/乐奇眼镜场景的 `Lingzhu <-> OpenClaw` 桥接插件。
 
 ## 安装
 
 ```bash
 # 从本地目录安装
-openclaw plugins install ./extensions/lingzhu
+openclaw plugins install ./extension
 
-# 或链接开发模式
-openclaw plugins install -l ./extensions/lingzhu
+# 或以开发模式链接安装
+openclaw plugins install --link ./extension
 ```
 
 ## 配置
 
-在 `moltbot.json` 中添加以下配置：
-
-### 1. 启用 HTTP Chat Completions 端点（必需）
+在 `openclaw.json` 或 `moltbot.json` 中加入：
 
 ```json5
 {
@@ -24,27 +22,31 @@ openclaw plugins install -l ./extensions/lingzhu
     "http": {
       "endpoints": {
         "chatCompletions": {
-          "enabled": true  // 必须启用，插件依赖此 API
+          "enabled": true
         }
       }
     }
-  }
-}
-```
-
-> ⚠️ **重要**: 此配置是必需的，插件通过 `/v1/chat/completions` API 调用 Agent。
-
-### 2. 插件配置
-
-```json5
-{
+  },
   "plugins": {
     "entries": {
       "lingzhu": {
         "enabled": true,
         "config": {
-          "authAk": "your-secret-ak",  // 可选，留空自动生成
-          "agentId": "main"             // 可选，默认 main
+          "authAk": "",
+          "agentId": "main",
+          "includeMetadata": true,
+          "requestTimeoutMs": 60000,
+          "sessionMode": "per_user",
+          "sessionNamespace": "lingzhu",
+          "defaultNavigationMode": "0",
+          "enableFollowUp": true,
+          "followUpMaxCount": 3,
+          "maxImageBytes": 5242880,
+          "systemPrompt": "你是部署在 Rokid 眼镜上的智能助手。",
+          "debugLogging": true,
+          "debugLogPayloads": false,
+          "debugLogDir": "",
+          "enableExperimentalNativeActions": true
         }
       }
     }
@@ -52,101 +54,53 @@ openclaw plugins install -l ./extensions/lingzhu
 }
 ```
 
-## 使用
-
-### Gateway 启动时
-
-启动 Gateway 后会自动显示连接信息：
-
-```
-╔═══════════════════════════════════════════════════════════════════════╗
-║                    Lingzhu Bridge 已启动                              ║
-╠═══════════════════════════════════════════════════════════════════════╣
-║  SSE 接口:  http://127.0.0.1:18789/metis/agent/api/sse                ║
-║  鉴权 AK:   xxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx                          ║
-╚═══════════════════════════════════════════════════════════════════════╝
-```
-
-### CLI 命令
+## CLI
 
 ```bash
-# 查看连接信息
 openclaw lingzhu info
-
-# 查看状态
 openclaw lingzhu status
+openclaw lingzhu curl
+openclaw lingzhu capabilities
+openclaw lingzhu logpath
+openclaw lingzhu doctor
+openclaw lingzhu cache-cleanup
 ```
 
-### 提交给灵珠平台
-
-1. **智能体SSE接口地址**: `http://<公网IP>/metis/agent/api/sse`
-2. **智能体鉴权AK**: CLI 显示的 AK 值
-
-## 4. 测试示例
-
-### 本地测试
+## 健康检查
 
 ```bash
-curl -X POST 'http://127.0.0.1:18789/metis/agent/api/sse' \
---header 'Authorization: Bearer {your key}' \
---header 'Content-Type: application/json' \
---data '{
-  "message_id": "test_local_01",
-  "agent_id": "main",
-  "message": [
-    {"role": "user", "type": "text", "text": "你好"}
-  ]
-}'
+curl http://127.0.0.1:18789/metis/agent/api/health
 ```
 
-### 公网域名测试
+## 调试日志
 
-```bash
-curl --location 'https://<您的域名>/metis/agent/api/sse' \
---header 'Authorization: Bearer <您的AK>' \
---header 'Content-Type: application/json' \
---data '{
-  "message_id": "test_ngrok_01",
-  "agent_id": "main",
-  "message": [
-    {"role": "user", "type": "text", "text": "你好"}
-  ]
-}'
+启用 `debugLogging` 后，桥接日志默认写入插件目录下的 `logs/`：
 
-```
+- `logs/lingzhu-YYYY-MM-DD.log`
 
-## API 端点
+联调时建议先这样配置：
 
-### POST /metis/agent/api/sse
+- `debugLogging: true`
+- `debugLogPayloads: false`
 
-灵珠平台调用的 SSE 接口。
+只有在需要精确排查协议载荷时，再临时改为：
 
-**请求头**:
-```
-Authorization: Bearer <AK>
-Content-Type: application/json
-```
+- `debugLogPayloads: true`
 
-**请求体**:
-```json
-{
-  "message_id": "消息ID",
-  "agent_id": "智能体ID",
-  "message": [
-    { "role": "user", "type": "text", "text": "你好" }
-  ]
-}
-```
+## 实验性原生动作
 
-**响应** (SSE):
-```
-event:message
-data:{"role":"agent","type":"answer","answer_stream":"你好","message_id":"...","is_finish":false}
+启用 `enableExperimentalNativeActions` 后，会额外向模型暴露这些实验动作：
 
-event:done
-data:[DONE]
-```
+- `send_notification`
+- `send_toast`
+- `speak_tts`
+- `start_video_record`
+- `stop_video_record`
+- `open_custom_view`
 
-## License
+这些动作是否被灵珠平台或眼镜端真实识别，仍需真机联调验证。
 
-MIT
+## 额外工具
+
+- `openclaw lingzhu doctor`: 输出当前桥接自检结果，适合部署后快速核对配置。
+- `openclaw lingzhu cache-cleanup`: 清理 24 小时前的图片缓存，避免联调过程中缓存目录持续膨胀。

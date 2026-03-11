@@ -66,15 +66,20 @@ export function writeDebugLog(
   }
 
   const filePath = getDebugLogFilePath(config);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-
   const line = JSON.stringify({
     ts: new Date().toISOString(),
     event,
     payload: redactValue(payload),
   });
 
-  fs.appendFileSync(filePath, `${line}\n`, "utf8");
+  void (async () => {
+    try {
+      await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.promises.appendFile(filePath, `${line}\n`, "utf8");
+    } catch {
+      // Ignore logging failures so debug logging cannot break request handling.
+    }
+  })();
 }
 
 export function summarizeForDebug(value: unknown, includePayload: boolean): unknown {
